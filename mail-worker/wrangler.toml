@@ -3,6 +3,9 @@ main = "src/index.js"
 compatibility_date = "2025-06-04"
 keep_vars = true
 
+[placement]
+mode = "smart"
+
 [observability]
 enabled = true
 
