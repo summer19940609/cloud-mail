@@ -9,14 +9,14 @@ mode = "smart"
 [observability]
 enabled = true
 
-#[[d1_databases]]
-#binding = "db"			#d1数据库绑定名默认不可修改
-#database_name = ""		#d1数据库名字
-#database_id = ""		#d1数据库id
+[[d1_databases]]
+binding = "db"			#d1数据库绑定名默认不可修改
+database_name = "cloud-mail"		#d1数据库名字
+database_id = "ffbcfe43-122e-418f-9d7b-e8e5d2a768ac"		#d1数据库id
 
-#[[kv_namespaces]]
-#binding = "kv"			#kv绑定名默认不可修改
-#id = ""					#kv数据库id
+[[kv_namespaces]]
+binding = "kv"			#kv绑定名默认不可修改
+id = "6b137a18881f4a46a60d7b4d49fa64bd"					#kv数据库id
 
 #[[r2_buckets]]
 #binding = "r2"			#r2对象存储绑定名默认不可修改
