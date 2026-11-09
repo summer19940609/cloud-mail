@@ -22,8 +22,8 @@ id = "6b137a18881f4a46a60d7b4d49fa64bd"					#kv数据库id
 #binding = "r2"			#r2对象存储绑定名默认不可修改
 #bucket_name = ""		#r2对象存储桶的名字
 
-#[[send_email]]
-#name = "email"			#CF发件, 配置后优先使用
+[[send_email]]
+name = "email"			#CF发件, 配置后优先使用（免费套餐仅可发往已验证目的地址）
 
 [ai]
 binding = "ai"
