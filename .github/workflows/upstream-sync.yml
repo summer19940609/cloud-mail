@@ -1,0 +1,265 @@
+name: Upstream Sync
+
+# Keeps this fork on the latest *release* of maillab/cloud-mail.
+# - Tracks the latest GitHub release tag (not upstream main) so only tagged versions land here.
+# - Never takes upstream's mail-worker/wrangler.toml (pinned D1/KV/placement/send_email live there)
+#   or anything under .github (this fork's own workflows).
+# - Progress is recorded in .upstream-sync (line 1: upstream commit SHA, line 2: release tag).
+# - Pushes to main only after the frontend build and a full wrangler dry-run bundle succeed.
+# - Pushes made with GITHUB_TOKEN do not trigger other workflows, so this does NOT deploy;
+#   production (xnj-cloud-mail) is deployed separately.
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    # Daily 08:00 Asia/Shanghai (UTC 00:00)
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream tag or commit to sync (blank = latest release)"
+        required: false
+        default: ""
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: maillab/cloud-mail
+  WRANGLER_SEND_METRICS: "false"
+
+jobs:
+  sync:
+    name: Sync maillab/cloud-mail (latest release)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream and detect changes
+        id: fetch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ github.event.inputs.ref }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --tags --force upstream main
+
+          if [[ -n "${INPUT_REF:-}" ]]; then
+            TAG="$INPUT_REF"
+          else
+            TAG="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" -q .tag_name 2>/dev/null || true)"
+            if [[ -z "$TAG" ]]; then
+              TAG="$(git tag -l 'v*' --sort=-v:refname | head -n1)"
+            fi
+          fi
+          if [[ -z "$TAG" ]]; then
+            echo "ERROR: could not determine upstream release" >&2
+            exit 1
+          fi
+
+          NEW_SHA="$(git rev-parse "${TAG}^{commit}")"
+          LAST_SHA=""
+          if [[ -f .upstream-sync ]]; then
+            LAST_SHA="$(head -n1 .upstream-sync | tr -d '[:space:]')"
+          fi
+
+          {
+            echo "last=$LAST_SHA"
+            echo "new=$NEW_SHA"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Last synced: ${LAST_SHA:-<none>}"
+          echo "Upstream ${TAG}: $NEW_SHA"
+
+          if [[ -n "$LAST_SHA" && "$LAST_SHA" == "$NEW_SHA" ]]; then
+            echo "already_synced=true" >> "$GITHUB_OUTPUT"
+            echo "Already synced — nothing to do."
+          elif [[ -n "$LAST_SHA" ]] && git merge-base --is-ancestor "$NEW_SHA" "$LAST_SHA" 2>/dev/null; then
+            echo "already_synced=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream $TAG is older than what is already synced — nothing to do."
+          else
+            echo "already_synced=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply upstream diff (preserve mail-worker/wrangler.toml and .github)
+        if: steps.fetch.outputs.already_synced != 'true'
+        run: |
+          set -euo pipefail
+          LAST_SHA="${{ steps.fetch.outputs.last }}"
+          NEW_SHA="${{ steps.fetch.outputs.new }}"
+          TAG="${{ steps.fetch.outputs.tag }}"
+
+          preserve_path() {
+            case "$1" in
+              mail-worker/wrangler.toml|.github|.github/*|.upstream-sync) return 0 ;;
+              .env|.env.*|*/.env|*/.env.*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
+          git archive --format=tar "$NEW_SHA" | tar -x -C "$TMP"
+
+          apply_add_or_modify() {
+            local path="$1"
+            if preserve_path "$path"; then
+              echo "skip preserved: $path"
+              return 0
+            fi
+            if [[ ! -e "$TMP/$path" ]]; then
+              echo "ERROR: missing in upstream archive: $path" >&2
+              exit 1
+            fi
+            mkdir -p -- "$(dirname "$path")"
+            cp -a -- "$TMP/$path" "$path"
+            echo "updated: $path"
+          }
+
+          apply_delete() {
+            local path="$1"
+            if preserve_path "$path"; then
+              echo "skip delete preserved: $path"
+              return 0
+            fi
+            rm -f -- "$path"
+            echo "deleted: $path"
+          }
+
+          if [[ -n "$LAST_SHA" ]] && git cat-file -e "${LAST_SHA}^{commit}" 2>/dev/null; then
+            echo "Applying $LAST_SHA..$NEW_SHA ($TAG)"
+            git diff -z --no-renames --name-status "$LAST_SHA" "$NEW_SHA" | python3 -c '
+          import sys
+          data = sys.stdin.buffer.read().split(b"\0")
+          i = 0
+          while i < len(data) and data[i]:
+              status = data[i].decode(); i += 1
+              path = data[i].decode(); i += 1
+              print("%s\t%s" % (status[0], path))
+          ' > /tmp/upstream-plan.tsv
+
+            while IFS=$'\t' read -r status path; do
+              [[ -z "${status:-}" ]] && continue
+              case "$status" in
+                A|M|T) apply_add_or_modify "$path" ;;
+                D) apply_delete "$path" ;;
+                *)
+                  echo "Unhandled status: $status $path" >&2
+                  exit 1
+                  ;;
+              esac
+            done < /tmp/upstream-plan.tsv
+
+            # Upstream binding changes are not applied automatically; surface them for review.
+            if ! git diff --quiet "$LAST_SHA" "$NEW_SHA" -- mail-worker/wrangler.toml; then
+              echo "::warning title=Upstream changed mail-worker/wrangler.toml::Kept the fork's pinned wrangler.toml. Review upstream changes (new bindings?) manually:"
+              git diff "$LAST_SHA" "$NEW_SHA" -- mail-worker/wrangler.toml
+            fi
+          else
+            echo "No usable last SHA — full tree copy excluding preserved paths"
+            (
+              cd "$TMP"
+              find . -type f -print
+            ) | while read -r rel; do
+              rel="${rel#./}"
+              preserve_path "$rel" && continue
+              mkdir -p -- "$(dirname "$rel")"
+              cp -a -- "$TMP/$rel" "$rel"
+            done
+          fi
+
+          printf '%s\n%s\n' "$NEW_SHA" "$TAG" > .upstream-sync
+
+          # Hard restore customizations
+          git checkout HEAD -- mail-worker/wrangler.toml .github
+
+          if ! git diff --quiet HEAD -- mail-worker/wrangler.toml .github; then
+            echo "ERROR: mail-worker/wrangler.toml or .github diverged from HEAD after sync" >&2
+            exit 1
+          fi
+          if [[ -n "$(git ls-files --others --exclude-standard -- .github)" ]]; then
+            echo "ERROR: upstream files leaked into .github" >&2
+            git ls-files --others --exclude-standard -- .github >&2
+            exit 1
+          fi
+
+          echo "Status after apply:"
+          git status --short | head -200
+
+      - name: Set up pnpm
+        if: steps.fetch.outputs.already_synced != 'true'
+        uses: pnpm/action-setup@v4.1.0
+        with:
+          version: 11
+
+      - name: Set up Node.js
+        if: steps.fetch.outputs.already_synced != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install, build, and verify worker bundle
+        if: steps.fetch.outputs.already_synced != 'true'
+        run: |
+          set -euo pipefail
+          # mail-worker's "pnpm test" script deploys to a test worker, so it is NOT run here.
+          # Verification = frontend production build + full wrangler bundle with the pinned config.
+          pnpm --dir mail-vue install --frozen-lockfile
+          pnpm --dir mail-vue run build
+          pnpm --dir mail-worker install --frozen-lockfile
+          (cd mail-worker && pnpm exec wrangler deploy --dry-run --outdir "$RUNNER_TEMP/worker-out")
+          test -s mail-worker/dist/index.html
+          # The build output must not be committed
+          git checkout -- mail-worker/dist 2>/dev/null || true
+
+      - name: Commit and push
+        if: steps.fetch.outputs.already_synced != 'true'
+        run: |
+          set -euo pipefail
+          NEW_SHA="${{ steps.fetch.outputs.new }}"
+          TAG="${{ steps.fetch.outputs.tag }}"
+          SHORT="$(printf '%s' "$NEW_SHA" | cut -c1-7)"
+          MSG="chore: sync upstream ${UPSTREAM_REPO} ${TAG} (${SHORT})"
+
+          git add -A
+          git reset -q HEAD -- .env '.env.*' '**/.env' '**/.env.*' 2>/dev/null || true
+
+          STAGED="$(git diff --cached --name-only)"
+          if grep -qx 'mail-worker/wrangler.toml' <<< "$STAGED"; then
+            echo "ERROR: mail-worker/wrangler.toml staged" >&2
+            exit 1
+          fi
+          if grep -E '^\.github/' <<< "$STAGED"; then
+            echo "ERROR: .github change staged" >&2
+            exit 1
+          fi
+          if grep -E '(^|/)\.env(\.|$)' <<< "$STAGED"; then
+            echo "ERROR: .env file staged" >&2
+            exit 1
+          fi
+          if grep -E '^mail-worker/dist/' <<< "$STAGED"; then
+            echo "ERROR: build output staged" >&2
+            exit 1
+          fi
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "$MSG"
+          git push origin HEAD:main
+          echo "Pushed: $MSG"
