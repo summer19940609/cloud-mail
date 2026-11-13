@@ -25,6 +25,11 @@ id = "6b137a18881f4a46a60d7b4d49fa64bd"					#kv数据库id
 #[[send_email]]
 #name = "email"			#CF发件, 配置后优先使用
 
+# v3.5.0: 站内邮件转发到「转发设置」里已在 Email Routing 验证过的地址；
+# 仅用于转发，不会启用 CF 发件（发件仍走 Resend，见 #14）
+[[send_email]]
+name = "forward"		#站内转发到已验证的其他邮箱，不限制单个地址
+
 [ai]
 binding = "ai"
 
